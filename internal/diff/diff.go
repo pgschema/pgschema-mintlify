@@ -1938,7 +1938,7 @@ func functionReferencesNewView(fn *ir.Function, newViews map[string]struct{}) bo
 }
 
 // extractBaseTypeName extracts the base type name from a type expression,
-// stripping SETOF prefix and array notation.
+// stripping SETOF prefix, array notation, and double quotes from identifiers.
 func extractBaseTypeName(typeExpr string) string {
 	t := strings.TrimSpace(typeExpr)
 	// Strip SETOF prefix (case-insensitive)
@@ -1949,6 +1949,8 @@ func extractBaseTypeName(typeExpr string) string {
 	for len(t) > 2 && t[len(t)-2:] == "[]" {
 		t = t[:len(t)-2]
 	}
+	// Strip double quotes from identifiers (e.g., public."ViewName" -> public.ViewName)
+	t = strings.ReplaceAll(t, "\"", "")
 	return t
 }
 
