@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -92,7 +93,7 @@ func GenerateTempSchemaName() string {
 // Only qualifications matching the specified schemaName are stripped.
 // All other schema qualifications are preserved as intentional cross-schema references.
 func stripSchemaQualifications(sql string, schemaName string) string {
-	if schemaName == "" {
+	if schemaName == "" || !strings.Contains(sql, schemaName) {
 		return sql
 	}
 
@@ -108,9 +109,104 @@ func stripSchemaQualifications(sql string, schemaName string) string {
 			// Preserve dollar-quoted content as-is
 			result.WriteString(seg.text)
 		} else {
-			result.WriteString(stripSchemaQualificationsFromText(seg.text, schemaName))
+			// Further split on single-quoted string literals to avoid stripping
+			// schema prefixes from inside string constants (Issue #371).
+			// e.g., has_scope('s.manage') must NOT become has_scope('manage')
+			result.WriteString(stripSchemaQualificationsPreservingStrings(seg.text, schemaName))
 		}
 	}
+	return result.String()
+}
+
+// stripSchemaQualificationsPreservingStrings splits text on single-quoted string
+// literals and SQL comments, applies schema stripping only to non-string,
+// non-comment parts, and reassembles.
+//
+// Limitation: E'...' escape-string syntax uses backslash-escaped quotes (E'it\'s')
+// rather than doubled quotes ('it''s'). This parser only recognises the '' form.
+// With E'content\'', a backslash-escaped quote may cause the parser to mistrack
+// string boundaries, which can result in either:
+//   - false-negative: schema qualifiers after the string are not stripped, or
+//   - false-positive: schema prefixes inside the E-string are incorrectly stripped.
+//
+// Both cases change semantics only for E'...' strings, which are extremely rare
+// in DDL schema definitions. The false-negative case preserves valid SQL; the
+// false-positive case could alter string content but is unlikely in practice.
+func stripSchemaQualificationsPreservingStrings(text string, schemaName string) string {
+	var result strings.Builder
+	result.Grow(len(text))
+
+	// flushCode writes text[segStart:end] through schema stripping and advances segStart.
+	i := 0
+	segStart := 0
+
+	flushCode := func(end int) {
+		if end > segStart {
+			result.WriteString(stripSchemaQualificationsFromText(text[segStart:end], schemaName))
+		}
+		segStart = end
+	}
+	flushLiteral := func(end int) {
+		result.WriteString(text[segStart:end])
+		segStart = end
+	}
+
+	for i < len(text) {
+		ch := text[i]
+
+		// Start of single-quoted string literal
+		if ch == '\'' {
+			flushCode(i)
+			i++ // skip opening quote
+			for i < len(text) {
+				if text[i] == '\'' {
+					if i+1 < len(text) && text[i+1] == '\'' {
+						i += 2 // skip escaped ''
+					} else {
+						i++ // skip closing quote
+						break
+					}
+				} else {
+					i++
+				}
+			}
+			flushLiteral(i)
+			continue
+		}
+
+		// Start of line comment (--)
+		if ch == '-' && i+1 < len(text) && text[i+1] == '-' {
+			flushCode(i)
+			i += 2
+			for i < len(text) && text[i] != '\n' {
+				i++
+			}
+			if i < len(text) {
+				i++ // skip the newline
+			}
+			flushLiteral(i)
+			continue
+		}
+
+		// Start of block comment (/* ... */)
+		if ch == '/' && i+1 < len(text) && text[i+1] == '*' {
+			flushCode(i)
+			i += 2
+			for i < len(text) {
+				if text[i] == '*' && i+1 < len(text) && text[i+1] == '/' {
+					i += 2
+					break
+				}
+				i++
+			}
+			flushLiteral(i)
+			continue
+		}
+
+		i++
+	}
+	// Remaining text is code
+	flushCode(i)
 	return result.String()
 }
 
@@ -165,82 +261,61 @@ func splitDollarQuotedSegments(sql string) []dollarQuotedSegment {
 	return segments
 }
 
-// stripSchemaQualificationsFromText performs the actual schema qualification stripping on a text segment.
-func stripSchemaQualificationsFromText(text string, schemaName string) string {
-	// Escape the schema name for use in regex
+// schemaRegexes holds compiled regexes for a specific schema name, avoiding
+// recompilation on every call to stripSchemaQualificationsFromText.
+type schemaRegexes struct {
+	re1 *regexp.Regexp // "schema"."object"
+	re2 *regexp.Regexp // "schema".object
+	re3 *regexp.Regexp // schema."object"
+	re4 *regexp.Regexp // schema.object
+}
+
+var (
+	schemaRegexCache   = make(map[string]*schemaRegexes)
+	schemaRegexCacheMu sync.Mutex
+)
+
+func getSchemaRegexes(schemaName string) *schemaRegexes {
+	schemaRegexCacheMu.Lock()
+	defer schemaRegexCacheMu.Unlock()
+	if cached, ok := schemaRegexCache[schemaName]; ok {
+		return cached
+	}
 	escapedSchema := regexp.QuoteMeta(schemaName)
+	// Patterns 1-2: quoted schema ("schema".object / "schema"."object")
+	// The leading " already prevents suffix matching.
+	// Patterns 3-4: unquoted schema (schema.object / schema."object")
+	// Use a capture group for the optional non-identifier prefix so we can
+	// preserve it in replacement without the match[0] ambiguity at ^.
+	// The character class [^a-zA-Z0-9_$"] ensures the schema name isn't a
+	// suffix of a longer identifier (e.g., schema "s" won't match "sales").
+	sr := &schemaRegexes{
+		re1: regexp.MustCompile(fmt.Sprintf(`"%s"\.(\"[^"]+\")`, escapedSchema)),
+		re2: regexp.MustCompile(fmt.Sprintf(`"%s"\.([a-zA-Z_][a-zA-Z0-9_$]*)`, escapedSchema)),
+		re3: regexp.MustCompile(fmt.Sprintf(`(^|[^a-zA-Z0-9_$"])%s\.(\"[^"]+\")`, escapedSchema)),
+		re4: regexp.MustCompile(fmt.Sprintf(`(^|[^a-zA-Z0-9_$"])%s\.([a-zA-Z_][a-zA-Z0-9_$]*)`, escapedSchema)),
+	}
+	schemaRegexCache[schemaName] = sr
+	return sr
+}
 
-	// Pattern matches schema qualification and captures the object name
-	// We need to handle 4 cases:
-	// 1. unquoted_schema.unquoted_object  -> unquoted_object
-	// 2. unquoted_schema."quoted_object"  -> "quoted_object"
-	// 3. "quoted_schema".unquoted_object  -> unquoted_object
-	// 4. "quoted_schema"."quoted_object"  -> "quoted_object"
-	//
-	// Key: The dot must be outside quotes (a schema.object separator, not part of an identifier)
-	// Important: For unquoted schema patterns, we must ensure the schema name isn't inside a quoted identifier
-	// Example: Don't match 'public' in CREATE INDEX "public.idx" where the whole thing is a quoted identifier
-
-	// Pattern 1: quoted schema + dot + quoted object: "schema"."object"
-	// Example: "public"."table" -> "table"
-	pattern1 := fmt.Sprintf(`"%s"\.(\"[^"]+\")`, escapedSchema)
-	re1 := regexp.MustCompile(pattern1)
-
-	// Pattern 2: quoted schema + dot + unquoted object: "schema".object
-	// Example: "public".table -> table
-	pattern2 := fmt.Sprintf(`"%s"\.([a-zA-Z_][a-zA-Z0-9_$]*)`, escapedSchema)
-	re2 := regexp.MustCompile(pattern2)
-
-	// Pattern 3: unquoted schema + dot + quoted object: schema."object"
-	// Example: public."table" -> "table"
-	// Use negative lookbehind to ensure schema isn't preceded by a quote
-	// and negative lookahead to ensure the dot after schema isn't inside quotes
-	pattern3 := fmt.Sprintf(`(?:^|[^"])%s\.(\"[^"]+\")`, escapedSchema)
-	re3 := regexp.MustCompile(pattern3)
-
-	// Pattern 4: unquoted schema + dot + unquoted object: schema.object
-	// Example: public.table -> table
-	// Use negative lookbehind to ensure schema isn't preceded by a quote
-	pattern4 := fmt.Sprintf(`(?:^|[^"])%s\.([a-zA-Z_][a-zA-Z0-9_$]*)`, escapedSchema)
-	re4 := regexp.MustCompile(pattern4)
+// stripSchemaQualificationsFromText performs the actual schema qualification stripping on a text segment.
+// It handles 4 cases:
+// 1. unquoted_schema.unquoted_object  -> unquoted_object
+// 2. unquoted_schema."quoted_object"  -> "quoted_object"
+// 3. "quoted_schema".unquoted_object  -> unquoted_object
+// 4. "quoted_schema"."quoted_object"  -> "quoted_object"
+func stripSchemaQualificationsFromText(text string, schemaName string) string {
+	sr := getSchemaRegexes(schemaName)
 
 	result := text
 	// Apply in order: quoted schema first to avoid double-matching
-	result = re1.ReplaceAllString(result, "$1")
-	result = re2.ReplaceAllString(result, "$1")
-	// For patterns 3 and 4, we need to preserve the character before the schema
-	result = re3.ReplaceAllStringFunc(result, func(match string) string {
-		// If match starts with a non-quote character, preserve it
-		if len(match) > 0 && match[0] != '"' {
-			// Extract the quote identifier (everything after schema.)
-			parts := strings.SplitN(match, ".", 2)
-			if len(parts) == 2 {
-				return string(match[0]) + parts[1]
-			}
-		}
-		// Otherwise just return the captured quoted identifier
-		parts := strings.SplitN(match, ".", 2)
-		if len(parts) == 2 {
-			return parts[1]
-		}
-		return match
-	})
-	result = re4.ReplaceAllStringFunc(result, func(match string) string {
-		// If match starts with a non-quote character, preserve it
-		if len(match) > 0 && match[0] != '"' {
-			// Extract the unquoted identifier (everything after schema.)
-			parts := strings.SplitN(match, ".", 2)
-			if len(parts) == 2 {
-				return string(match[0]) + parts[1]
-			}
-		}
-		// Otherwise just return the captured unquoted identifier
-		parts := strings.SplitN(match, ".", 2)
-		if len(parts) == 2 {
-			return parts[1]
-		}
-		return match
-	})
+	result = sr.re1.ReplaceAllString(result, "$1")
+	result = sr.re2.ReplaceAllString(result, "$1")
+	// For patterns 3 and 4, $1 is the prefix (boundary char or empty at ^),
+	// $2 is the object name — preserve the prefix and keep only the object.
+	result = sr.re3.ReplaceAllString(result, "${1}${2}")
+	result = sr.re4.ReplaceAllString(result, "${1}${2}")
 
 	return result
 }

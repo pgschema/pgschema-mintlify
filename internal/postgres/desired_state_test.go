@@ -194,3 +194,100 @@ func TestReplaceSchemaInSearchPath(t *testing.T) {
 		})
 	}
 }
+
+func TestStripSchemaQualifications_PreservesStringLiterals(t *testing.T) {
+	tests := []struct {
+		name     string
+		sql      string
+		schema   string
+		expected string
+	}{
+		{
+			name:     "strips schema from table reference",
+			sql:      "CREATE TABLE public.items (id int);",
+			schema:   "public",
+			expected: "CREATE TABLE items (id int);",
+		},
+		{
+			name:     "preserves schema prefix inside single-quoted string",
+			sql:      "CREATE POLICY p ON items USING (has_scope('public.manage'));",
+			schema:   "public",
+			expected: "CREATE POLICY p ON items USING (has_scope('public.manage'));",
+		},
+		{
+			name:     "preserves schema prefix inside string with short schema name",
+			sql:      "CREATE POLICY p ON items USING (has_scope('s.manage')) WITH CHECK (has_scope('s.manage'));",
+			schema:   "s",
+			expected: "CREATE POLICY p ON items USING (has_scope('s.manage')) WITH CHECK (has_scope('s.manage'));",
+		},
+		{
+			name:     "strips schema from identifier but preserves string literal",
+			sql:      "CREATE POLICY p ON s.items USING (auth.has_scope('s.manage'));",
+			schema:   "s",
+			expected: "CREATE POLICY p ON items USING (auth.has_scope('s.manage'));",
+		},
+		{
+			name:     "preserves escaped quotes in string literals",
+			sql:      "SELECT 'it''s public.test' FROM public.t;",
+			schema:   "public",
+			expected: "SELECT 'it''s public.test' FROM t;",
+		},
+		{
+			name:     "handles multiple string literals",
+			sql:      "SELECT 'public.a', public.t, 'public.b';",
+			schema:   "public",
+			expected: "SELECT 'public.a', t, 'public.b';",
+		},
+		{
+			name:     "does not match schema as suffix of longer identifier",
+			sql:      "SELECT sales.total, s.items FROM s.orders;",
+			schema:   "s",
+			expected: "SELECT sales.total, items FROM orders;",
+		},
+		{
+			name:     "strips schema at start of string",
+			sql:      "public.t",
+			schema:   "public",
+			expected: "t",
+		},
+		{
+			name:     "handles apostrophe in line comment followed by schema-qualified identifier",
+			sql:      "SELECT 1; -- don't drop public.t\nDROP TABLE public.t;",
+			schema:   "public",
+			expected: "SELECT 1; -- don't drop public.t\nDROP TABLE t;",
+		},
+		{
+			name:     "handles block comment with apostrophe",
+			sql:      "/* it's public.t */ DROP TABLE public.t;",
+			schema:   "public",
+			expected: "/* it's public.t */ DROP TABLE t;",
+		},
+		{
+			name:     "handles block comment without apostrophe",
+			sql:      "/* drop public.t */ DROP TABLE public.t;",
+			schema:   "public",
+			expected: "/* drop public.t */ DROP TABLE t;",
+		},
+		{
+			// Known limitation: E'...' escape-string syntax with backslash-escaped quotes
+			// is not handled. The parser treats \' as ordinary char + string-closer,
+			// mistracking boundaries. Here it strips inside the string (wrong) and
+			// misses the identifier after (also wrong). Both are safe: the SQL remains
+			// valid, and the unstripped qualifier just means the object is looked up
+			// in the original schema. E'...' in DDL is extremely rare.
+			name:     "E-string with backslash-escaped quote (known limitation)",
+			sql:      "SELECT E'it\\'s public.test' FROM public.t;",
+			schema:   "public",
+			expected: "SELECT E'it\\'s test' FROM public.t;",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := stripSchemaQualifications(tt.sql, tt.schema)
+			if result != tt.expected {
+				t.Errorf("stripSchemaQualifications(%q, %q)\n  got:  %q\n  want: %q", tt.sql, tt.schema, result, tt.expected)
+			}
+		})
+	}
+}
